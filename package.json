@@ -1,0 +1,29 @@
+{
+  "name": "clientcoded",
+  "version": "0.1.0",
+  "description": "ClientCoded SDK - Trace your AI agent's tool calls for root cause analysis",
+  "main": "src/index.js",
+  "types": "src/index.d.ts",
+  "keywords": [
+    "ai",
+    "agent",
+    "testing",
+    "qa",
+    "tracing",
+    "evaluation",
+    "llm"
+  ],
+  "author": "ClientCoded <travis@clientcoded.com>",
+  "license": "MIT",
+  "homepage": "https://github.com/ClientCoded/clientcoded-js",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ClientCoded/clientcoded-js.git"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "files": [
+    "src/"
+  ]
+}
