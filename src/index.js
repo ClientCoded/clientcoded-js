@@ -1,4 +1,4 @@
-// ClientCoded JavaScript/TypeScript SDK
+// ClientCoded JavaScript/TypeScript SDK v0.2.0
 // npm install clientcoded
 
 const DEFAULT_API = "https://clientcoded.app.n8n.cloud/webhook/ap-35-trace-ingest";
@@ -11,13 +11,11 @@ let _config = {
 
 let _conversationId = null;
 let _turn = null;
+let _parentTraceId = null;
+const _instrumented = new Set();
 
 /**
  * Configure the SDK globally.
- * @param {Object} config
- * @param {string} config.agentId - Your agent's ID from ClientCoded dashboard
- * @param {string} config.apiKey - Your API key from ClientCoded dashboard
- * @param {string} [config.traceUrl] - Optional custom trace endpoint URL
  */
 function configure(config) {
   _config.agentId = config.agentId;
@@ -28,8 +26,7 @@ function configure(config) {
 }
 
 /**
- * Set the current conversation ID. Call at the start of each conversation.
- * @param {string} conversationId
+ * Set the current conversation ID.
  */
 function setConversationId(conversationId) {
   _conversationId = conversationId;
@@ -38,7 +35,6 @@ function setConversationId(conversationId) {
 
 /**
  * Set the current turn number.
- * @param {number} turnNumber
  */
 function setTurn(turnNumber) {
   _turn = turnNumber;
@@ -52,20 +48,14 @@ function incrementTurn() {
 }
 
 /**
- * Wrap a function with tracing.
- * 
- * Usage:
- *   const getInvoice = trace("get_invoice", async (invoiceId) => {
- *     return await stripe.invoices.retrieve(invoiceId);
- *   });
- * 
- * @param {string} name - Name for this traced function
- * @param {Function} fn - The function to trace
- * @returns {Function} - Wrapped function with tracing
+ * Wrap an async function with tracing and parent-child nesting.
  */
 function trace(name, fn) {
   return async function (...args) {
     const traceId = _uuid();
+    const parentId = _parentTraceId;
+    _parentTraceId = traceId;
+
     const start = Date.now();
     let error = null;
     let result = null;
@@ -77,8 +67,11 @@ function trace(name, fn) {
       error = e.message || String(e);
       throw e;
     } finally {
+      _parentTraceId = parentId;
+
       _sendTrace({
         traceId,
+        parentTraceId: parentId,
         toolName: name,
         input: _safeSerializeInput(args),
         output: _safeSerializeOutput(result),
@@ -90,20 +83,14 @@ function trace(name, fn) {
 }
 
 /**
- * Wrap a synchronous function with tracing.
- * 
- * Usage:
- *   const parseData = traceSync("parse_data", (raw) => {
- *     return JSON.parse(raw);
- *   });
- * 
- * @param {string} name - Name for this traced function
- * @param {Function} fn - The synchronous function to trace
- * @returns {Function} - Wrapped function with tracing
+ * Wrap a synchronous function with tracing and parent-child nesting.
  */
 function traceSync(name, fn) {
   return function (...args) {
     const traceId = _uuid();
+    const parentId = _parentTraceId;
+    _parentTraceId = traceId;
+
     const start = Date.now();
     let error = null;
     let result = null;
@@ -115,8 +102,11 @@ function traceSync(name, fn) {
       error = e.message || String(e);
       throw e;
     } finally {
+      _parentTraceId = parentId;
+
       _sendTrace({
         traceId,
+        parentTraceId: parentId,
         toolName: name,
         input: _safeSerializeInput(args),
         output: _safeSerializeOutput(result),
@@ -128,27 +118,12 @@ function traceSync(name, fn) {
 }
 
 /**
- * Manual trace logging for cases where wrappers don't fit.
- * 
- * Usage:
- *   const start = Date.now();
- *   try {
- *     const result = await complexOperation();
- *     logTrace("complex_op", { input: { key: "val" }, output: result });
- *   } catch (e) {
- *     logTrace("complex_op", { input: { key: "val" }, error: e.message });
- *   }
- * 
- * @param {string} toolName
- * @param {Object} data
- * @param {*} [data.input]
- * @param {*} [data.output]
- * @param {string} [data.error]
- * @param {number} [data.latencyMs]
+ * Manual trace logging.
  */
 function logTrace(toolName, data = {}) {
   _sendTrace({
     traceId: _uuid(),
+    parentTraceId: _parentTraceId,
     toolName,
     input: data.input ? _safeSerializeInput([data.input]) : null,
     output: data.output ? _safeSerializeOutput(data.output) : null,
@@ -158,30 +133,229 @@ function logTrace(toolName, data = {}) {
 }
 
 /**
- * Create a traced wrapper for a LangChain tool function.
+ * Auto-instrument supported frameworks.
  * 
  * Usage:
- *   const searchDb = traceLangChain("search_database", async (query) => {
- *     return await db.execute(query);
- *   });
- * 
- * @param {string} name
- * @param {Function} fn
- * @returns {Function}
+ *   const clientcoded = require('clientcoded');
+ *   clientcoded.configure({ agentId: 'xxx', apiKey: 'xxx' });
+ *   clientcoded.autoInstrument({ frameworks: ['openai', 'anthropic'] });
  */
-function traceLangChain(name, fn) {
-  return trace(name, fn);
+function autoInstrument(options = {}) {
+  const frameworks = options.frameworks || ['openai', 'anthropic'];
+
+  for (const framework of frameworks) {
+    if (_instrumented.has(framework)) continue;
+
+    if (framework === 'openai') _instrumentOpenAI();
+    if (framework === 'anthropic') _instrumentAnthropic();
+    if (framework === 'langchain') _instrumentLangChain();
+
+    _instrumented.add(framework);
+  }
+}
+
+function _instrumentOpenAI() {
+  try {
+    const openai = require('openai');
+    const OpenAI = openai.default || openai.OpenAI || openai;
+
+    if (!OpenAI || !OpenAI.prototype) return;
+
+    const origChat = OpenAI.prototype.chat;
+    if (!origChat) return;
+
+    const origCreate = origChat?.completions?.create;
+    if (!origCreate) return;
+
+    // Monkey-patch at the instance level via proxy
+    const origConstructor = OpenAI;
+    const patchedConstructor = function (...args) {
+      const instance = new origConstructor(...args);
+
+      const originalCreate = instance.chat.completions.create.bind(instance.chat.completions);
+      instance.chat.completions.create = async function (...createArgs) {
+        const traceId = _uuid();
+        const parentId = _parentTraceId;
+        _parentTraceId = traceId;
+        const start = Date.now();
+        let error = null;
+        let result = null;
+
+        try {
+          result = await originalCreate(...createArgs);
+          return result;
+        } catch (e) {
+          error = e.message || String(e);
+          throw e;
+        } finally {
+          _parentTraceId = parentId;
+
+          let output = null;
+          let inputTokens = null;
+          let outputTokens = null;
+
+          if (result?.choices?.[0]?.message?.content) {
+            output = result.choices[0].message.content.slice(0, 500);
+          }
+          if (result?.usage) {
+            inputTokens = result.usage.prompt_tokens;
+            outputTokens = result.usage.completion_tokens;
+          }
+
+          _sendTrace({
+            traceId,
+            parentTraceId: parentId,
+            toolName: 'openai.chat.completions',
+            input: {
+              kwargs: {
+                model: createArgs[0]?.model || 'unknown',
+                messages_count: String(createArgs[0]?.messages?.length || 0),
+              }
+            },
+            output,
+            error,
+            latencyMs: Date.now() - start,
+            extra: { input_tokens: inputTokens, output_tokens: outputTokens },
+          });
+        }
+      };
+
+      return instance;
+    };
+
+    // Copy static properties
+    Object.setPrototypeOf(patchedConstructor, origConstructor);
+    patchedConstructor.prototype = origConstructor.prototype;
+
+  } catch (e) {
+    // OpenAI not installed, skip silently
+  }
+}
+
+function _instrumentAnthropic() {
+  try {
+    const anthropic = require('@anthropic-ai/sdk');
+    const Anthropic = anthropic.default || anthropic.Anthropic || anthropic;
+
+    if (!Anthropic || !Anthropic.prototype) return;
+
+    const origConstructor = Anthropic;
+    const patchedConstructor = function (...args) {
+      const instance = new origConstructor(...args);
+
+      const originalCreate = instance.messages.create.bind(instance.messages);
+      instance.messages.create = async function (...createArgs) {
+        const traceId = _uuid();
+        const parentId = _parentTraceId;
+        _parentTraceId = traceId;
+        const start = Date.now();
+        let error = null;
+        let result = null;
+
+        try {
+          result = await originalCreate(...createArgs);
+          return result;
+        } catch (e) {
+          error = e.message || String(e);
+          throw e;
+        } finally {
+          _parentTraceId = parentId;
+
+          let output = null;
+          let inputTokens = null;
+          let outputTokens = null;
+
+          if (result?.content) {
+            const textBlocks = result.content
+              .filter(b => b.type === 'text')
+              .map(b => b.text);
+            output = textBlocks.join(' ').slice(0, 500);
+          }
+          if (result?.usage) {
+            inputTokens = result.usage.input_tokens;
+            outputTokens = result.usage.output_tokens;
+          }
+
+          _sendTrace({
+            traceId,
+            parentTraceId: parentId,
+            toolName: 'anthropic.messages',
+            input: {
+              kwargs: {
+                model: createArgs[0]?.model || 'unknown',
+                messages_count: String(createArgs[0]?.messages?.length || 0),
+              }
+            },
+            output,
+            error,
+            latencyMs: Date.now() - start,
+            extra: { input_tokens: inputTokens, output_tokens: outputTokens },
+          });
+        }
+      };
+
+      return instance;
+    };
+
+    Object.setPrototypeOf(patchedConstructor, origConstructor);
+    patchedConstructor.prototype = origConstructor.prototype;
+
+  } catch (e) {
+    // Anthropic not installed, skip silently
+  }
+}
+
+function _instrumentLangChain() {
+  try {
+    const { BaseTool } = require('@langchain/core/tools');
+
+    if (!BaseTool || !BaseTool.prototype) return;
+
+    const originalInvoke = BaseTool.prototype.invoke;
+
+    BaseTool.prototype.invoke = async function (input, config, ...rest) {
+      const traceId = _uuid();
+      const parentId = _parentTraceId;
+      _parentTraceId = traceId;
+      const start = Date.now();
+      let error = null;
+      let result = null;
+
+      try {
+        result = await originalInvoke.call(this, input, config, ...rest);
+        return result;
+      } catch (e) {
+        error = e.message || String(e);
+        throw e;
+      } finally {
+        _parentTraceId = parentId;
+
+        _sendTrace({
+          traceId,
+          parentTraceId: parentId,
+          toolName: 'langchain.tool.' + (this.name || this.constructor.name),
+          input: _safeSerializeInput([input]),
+          output: _safeSerializeOutput(result),
+          error,
+          latencyMs: Date.now() - start,
+        });
+      }
+    };
+  } catch (e) {
+    // LangChain not installed, skip silently
+  }
 }
 
 // === Internal functions ===
 
-function _sendTrace({ traceId, toolName, input, output, error, latencyMs }) {
+function _sendTrace({ traceId, parentTraceId, toolName, input, output, error, latencyMs, extra }) {
   if (!_config.agentId || !_config.apiKey) return;
 
   const payload = {
     agent_id: _config.agentId,
     api_key: _config.apiKey,
     trace_id: traceId,
+    parent_trace_id: parentTraceId || null,
     conversation_id: _conversationId,
     turn: _turn,
     tool_name: toolName,
@@ -192,7 +366,8 @@ function _sendTrace({ traceId, toolName, input, output, error, latencyMs }) {
     timestamp: Date.now() / 1000,
   };
 
-  // Fire and forget
+  if (extra) payload.extra = extra;
+
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 2000);
@@ -254,5 +429,5 @@ module.exports = {
   trace,
   traceSync,
   logTrace,
-  traceLangChain,
+  autoInstrument,
 };
