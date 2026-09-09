@@ -1,6 +1,6 @@
 {
   "name": "clientcoded",
-  "version": "0.2.0",
+  "version": "0.4.0",
   "description": "ClientCoded SDK - Trace your AI agent's tool calls for root cause analysis",
   "main": "src/index.js",
   "types": "src/index.d.ts",

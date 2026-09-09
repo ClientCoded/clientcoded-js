@@ -364,6 +364,8 @@ function _sendTrace({ traceId, parentTraceId, toolName, input, output, error, la
     error: error,
     latency_ms: latencyMs,
     timestamp: Date.now() / 1000,
+      test_run_id: getTestContext().test_run_id || null,
+      question_index: getTestContext().question_index != null ? getTestContext().question_index : null,
   };
 
   if (extra) payload.extra = extra;
@@ -421,7 +423,15 @@ function _uuid() {
   });
 }
 
+const { extractTestContext, runWithTestContext } = require('./context');
+const { expressMiddleware, fastifyPlugin } = require('./middleware');
+
 module.exports = {
+  extractTestContext,
+  getTestContext: require('./context').getTestContext,
+  runWithTestContext,
+  expressMiddleware,
+  fastifyPlugin,
   configure,
   setConversationId,
   setTurn,

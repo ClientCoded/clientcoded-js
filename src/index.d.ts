@@ -30,3 +30,9 @@ declare module "clientcoded" {
     fn: T
   ): T;
 }
+
+export function extractTestContext(headers: Record<string, string>): { test_run_id?: string; question_index?: number; agent_id?: string };
+export function getTestContext(): { test_run_id?: string; question_index?: number; agent_id?: string };
+export function runWithTestContext(ctx: object, fn: () => any): any;
+export function expressMiddleware(): (req: any, res: any, next: any) => void;
+export function fastifyPlugin(fastify: any, opts: any, done: any): void;
