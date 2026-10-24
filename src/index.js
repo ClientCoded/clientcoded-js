@@ -1,25 +1,53 @@
-// ClientCoded JavaScript/TypeScript SDK v0.2.0
+// ClientCoded JavaScript/TypeScript SDK v0.5.0
 // npm install clientcoded
+//
+// 0.5.0
+//   * FIX: 0.4.0 threw "getTestContext is not defined" from every traced
+//     function once configure() was called, breaking the customer's own
+//     code. Tracing can no longer throw into the caller.
+//   * Traces go to https://api.clientcoded.com/traces by default (was the
+//     n8n AP-35 webhook). configure({ traceUrl }) or CLIENTCODED_TRACE_URL
+//     still override it.
+//   * Parent/child links use AsyncLocalStorage, so concurrent requests in
+//     one process no longer get each other's steps as parents.
+//   * Long inputs/outputs cut to 2,000 characters now say how long they
+//     were and how many items/rows, e.g. "(truncated: 21,840 characters, 128 rows)".
+//   * One console warning per rejection reason (bad API key, wrong agent,
+//     rate limit) instead of failing silently.
 
-const DEFAULT_API = "https://clientcoded.app.n8n.cloud/webhook/ap-35-trace-ingest";
+const { AsyncLocalStorage } = require("node:async_hooks");
+const { extractTestContext, getTestContext, runWithTestContext } = require("./context");
+const { expressMiddleware, fastifyPlugin } = require("./middleware");
+
+const DEFAULT_API =
+  (typeof process !== "undefined" && process.env && process.env.CLIENTCODED_TRACE_URL) ||
+  "https://api.clientcoded.com/traces";
+const MAX_TRACE_CHARS = 2000;
+const _parentStore = new AsyncLocalStorage();
+const _warned = new Set();
 
 let _config = {
-  agentId: null,
-  apiKey: null,
+  agentId: (typeof process !== "undefined" && process.env && process.env.CLIENTCODED_AGENT_ID) || null,
+  apiKey: (typeof process !== "undefined" && process.env && process.env.CLIENTCODED_API_KEY) || null,
   traceUrl: DEFAULT_API,
 };
 
 let _conversationId = null;
 let _turn = null;
-let _parentTraceId = null;
+// Parent step for the code currently running. Kept per async call chain
+// (AsyncLocalStorage), not in one shared variable, so concurrent requests
+// don't adopt each other's steps as parents.
+function _currentParent() {
+  return _parentStore.getStore() || null;
+}
 const _instrumented = new Set();
 
 /**
  * Configure the SDK globally.
  */
-function configure(config) {
-  _config.agentId = config.agentId;
-  _config.apiKey = config.apiKey;
+function configure(config = {}) {
+  _config.agentId = config.agentId || _config.agentId;
+  _config.apiKey = config.apiKey || _config.apiKey;
   if (config.traceUrl) {
     _config.traceUrl = config.traceUrl;
   }
@@ -53,22 +81,19 @@ function incrementTurn() {
 function trace(name, fn) {
   return async function (...args) {
     const traceId = _uuid();
-    const parentId = _parentTraceId;
-    _parentTraceId = traceId;
+    const parentId = _currentParent();
 
     const start = Date.now();
     let error = null;
     let result = null;
 
     try {
-      result = await fn(...args);
+      result = await _parentStore.run(traceId, () => fn.apply(this, args));
       return result;
     } catch (e) {
-      error = e.message || String(e);
+      error = (e && e.message) || String(e);
       throw e;
     } finally {
-      _parentTraceId = parentId;
-
       _sendTrace({
         traceId,
         parentTraceId: parentId,
@@ -88,22 +113,19 @@ function trace(name, fn) {
 function traceSync(name, fn) {
   return function (...args) {
     const traceId = _uuid();
-    const parentId = _parentTraceId;
-    _parentTraceId = traceId;
+    const parentId = _currentParent();
 
     const start = Date.now();
     let error = null;
     let result = null;
 
     try {
-      result = fn(...args);
+      result = _parentStore.run(traceId, () => fn.apply(this, args));
       return result;
     } catch (e) {
-      error = e.message || String(e);
+      error = (e && e.message) || String(e);
       throw e;
     } finally {
-      _parentTraceId = parentId;
-
       _sendTrace({
         traceId,
         parentTraceId: parentId,
@@ -123,7 +145,7 @@ function traceSync(name, fn) {
 function logTrace(toolName, data = {}) {
   _sendTrace({
     traceId: _uuid(),
-    parentTraceId: _parentTraceId,
+    parentTraceId: _currentParent(),
     toolName,
     input: data.input ? _safeSerializeInput([data.input]) : null,
     output: data.output ? _safeSerializeOutput(data.output) : null,
@@ -175,8 +197,7 @@ function _instrumentOpenAI() {
       const originalCreate = instance.chat.completions.create.bind(instance.chat.completions);
       instance.chat.completions.create = async function (...createArgs) {
         const traceId = _uuid();
-        const parentId = _parentTraceId;
-        _parentTraceId = traceId;
+        const parentId = _currentParent();
         const start = Date.now();
         let error = null;
         let result = null;
@@ -188,7 +209,6 @@ function _instrumentOpenAI() {
           error = e.message || String(e);
           throw e;
         } finally {
-          _parentTraceId = parentId;
 
           let output = null;
           let inputTokens = null;
@@ -246,8 +266,7 @@ function _instrumentAnthropic() {
       const originalCreate = instance.messages.create.bind(instance.messages);
       instance.messages.create = async function (...createArgs) {
         const traceId = _uuid();
-        const parentId = _parentTraceId;
-        _parentTraceId = traceId;
+        const parentId = _currentParent();
         const start = Date.now();
         let error = null;
         let result = null;
@@ -259,7 +278,6 @@ function _instrumentAnthropic() {
           error = e.message || String(e);
           throw e;
         } finally {
-          _parentTraceId = parentId;
 
           let output = null;
           let inputTokens = null;
@@ -315,8 +333,7 @@ function _instrumentLangChain() {
 
     BaseTool.prototype.invoke = async function (input, config, ...rest) {
       const traceId = _uuid();
-      const parentId = _parentTraceId;
-      _parentTraceId = traceId;
+      const parentId = _currentParent();
       const start = Date.now();
       let error = null;
       let result = null;
@@ -328,7 +345,6 @@ function _instrumentLangChain() {
         error = e.message || String(e);
         throw e;
       } finally {
-        _parentTraceId = parentId;
 
         _sendTrace({
           traceId,
@@ -349,30 +365,34 @@ function _instrumentLangChain() {
 // === Internal functions ===
 
 function _sendTrace({ traceId, parentTraceId, toolName, input, output, error, latencyMs, extra }) {
-  if (!_config.agentId || !_config.apiKey) return;
-
-  const payload = {
-    agent_id: _config.agentId,
-    api_key: _config.apiKey,
-    trace_id: traceId,
-    parent_trace_id: parentTraceId || null,
-    conversation_id: _conversationId,
-    turn: _turn,
-    tool_name: toolName,
-    input: input,
-    output: output,
-    error: error,
-    latency_ms: latencyMs,
-    timestamp: Date.now() / 1000,
-      test_run_id: getTestContext().test_run_id || null,
-      question_index: getTestContext().question_index != null ? getTestContext().question_index : null,
-  };
-
-  if (extra) payload.extra = extra;
-
+  // Tracing must never throw into the customer's code.
   try {
+    if (!_config.apiKey) return;
+    const ctx = getTestContext() || {};
+    // agentId is required for live traffic; test traces are filed under the
+    // test run's agent server-side, so they may be sent without one.
+    if (!_config.agentId && !ctx.test_run_id) return;
+
+    const payload = {
+      agent_id: _config.agentId,
+      api_key: _config.apiKey,
+      trace_id: traceId,
+      parent_trace_id: parentTraceId || null,
+      conversation_id: _conversationId,
+      turn: _turn,
+      tool_name: toolName,
+      input: input,
+      output: output,
+      error: error,
+      latency_ms: latencyMs,
+      timestamp: Date.now() / 1000,
+      test_run_id: ctx.test_run_id || null,
+      question_index: ctx.question_index != null ? ctx.question_index : null,
+    };
+    if (extra) payload.extra = extra;
+
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 2000);
+    const timeout = setTimeout(() => controller.abort(), 5000);
 
     fetch(_config.traceUrl, {
       method: "POST",
@@ -380,6 +400,17 @@ function _sendTrace({ traceId, parentTraceId, toolName, input, output, error, la
       body: JSON.stringify(payload),
       signal: controller.signal,
     })
+      .then(async (res) => {
+        if (res && res.status >= 400) {
+          let msg = "";
+          try { msg = (await res.json()).message || ""; } catch { /* ignore */ }
+          const key = res.status + "|" + msg;
+          if (!_warned.has(key)) {
+            _warned.add(key);
+            console.warn("[clientcoded] trace rejected (" + res.status + "): " + (msg || "see the ClientCoded dashboard"));
+          }
+        }
+      })
       .catch(() => {})
       .finally(() => clearTimeout(timeout));
   } catch {
@@ -389,7 +420,7 @@ function _sendTrace({ traceId, parentTraceId, toolName, input, output, error, la
 
 function _safeSerializeInput(args) {
   try {
-    const serialized = args.map((a) => _truncate(JSON.stringify(a)));
+    const serialized = args.map((a) => _truncate(JSON.stringify(a), MAX_TRACE_CHARS, _describe(a)));
     return { args: serialized };
   } catch {
     return { error: "unserializable" };
@@ -399,15 +430,35 @@ function _safeSerializeInput(args) {
 function _safeSerializeOutput(result) {
   if (result === null || result === undefined) return null;
   try {
-    return _truncate(JSON.stringify(result));
+    return _truncate(JSON.stringify(result), MAX_TRACE_CHARS, _describe(result));
   } catch {
     return "unserializable";
   }
 }
 
-function _truncate(s, maxLen = 2000) {
+// Short size summary for lists/results, e.g. "128 rows".
+function _describe(v) {
+  try {
+    if (Array.isArray(v)) return v.length.toLocaleString("en-US") + " items";
+    if (v && typeof v === "object") {
+      if (typeof v.rows_returned === "number") return v.rows_returned.toLocaleString("en-US") + " rows";
+      for (const k of ["result", "results", "rows", "data", "items", "records", "documents"]) {
+        if (Array.isArray(v[k])) {
+          const unit = ["result", "results", "rows", "records"].includes(k) ? " rows" : " items";
+          return v[k].length.toLocaleString("en-US") + unit;
+        }
+      }
+    }
+  } catch { /* ignore */ }
+  return null;
+}
+
+function _truncate(s, maxLen = MAX_TRACE_CHARS, desc = null) {
+  if (typeof s !== "string") return s;
   if (s.length > maxLen) {
-    return s.slice(0, maxLen) + "... (truncated)";
+    let note = s.length.toLocaleString("en-US") + " characters";
+    if (desc) note += ", " + desc;
+    return s.slice(0, maxLen) + "... (truncated: " + note + ")";
   }
   return s;
 }
@@ -423,12 +474,9 @@ function _uuid() {
   });
 }
 
-const { extractTestContext, runWithTestContext } = require('./context');
-const { expressMiddleware, fastifyPlugin } = require('./middleware');
-
 module.exports = {
   extractTestContext,
-  getTestContext: require('./context').getTestContext,
+  getTestContext,
   runWithTestContext,
   expressMiddleware,
   fastifyPlugin,

@@ -1,7 +1,7 @@
 declare module "clientcoded" {
   interface ConfigOptions {
-    agentId: string;
-    apiKey: string;
+    agentId?: string;
+    apiKey?: string;
     traceUrl?: string;
   }
 
@@ -12,7 +12,7 @@ declare module "clientcoded" {
     latencyMs?: number;
   }
 
-  export function configure(config: ConfigOptions): void;
+  export function configure(config?: ConfigOptions): void;
   export function setConversationId(conversationId: string): void;
   export function setTurn(turnNumber: number): void;
   export function incrementTurn(): void;
@@ -25,10 +25,7 @@ declare module "clientcoded" {
     fn: T
   ): T;
   export function logTrace(toolName: string, data?: TraceData): void;
-  export function traceLangChain<T extends (...args: any[]) => Promise<any>>(
-    name: string,
-    fn: T
-  ): T;
+  export function autoInstrument(options?: { frameworks?: Array<"openai" | "anthropic" | "langchain"> }): void;
 }
 
 export function extractTestContext(headers: Record<string, string>): { test_run_id?: string; question_index?: number; agent_id?: string };
